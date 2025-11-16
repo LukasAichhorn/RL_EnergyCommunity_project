@@ -117,6 +117,18 @@ def main():
         default=20000,
         help="Number of timesteps to generate for synthetic training data"
     )
+    parser.add_argument(
+        "--continue-battery-state",
+        action="store_true",
+        help="Continue battery SOC across episodes (no reset between episodes). Default: True"
+    )
+    parser.add_argument(
+        "--no-continue-battery-state",
+        dest="continue_battery_state",
+        action="store_false",
+        help="Reset battery SOC each episode (disable continuous battery state)"
+    )
+    parser.set_defaults(continue_battery_state=True)
     
     args = parser.parse_args()
     
@@ -148,6 +160,7 @@ def main():
         "normalize_state": True,
         "train_split": args.train_split,
         "mode": "train",  # Use training data split
+        "continue_battery_state": args.continue_battery_state,  # Continue SOC across episodes
         "seed": args.seed,
     }
     
@@ -162,6 +175,7 @@ def main():
         "normalize_state": True,
         "train_split": args.train_split,
         "mode": "test",  # Use test data split (real data)
+        "continue_battery_state": args.continue_battery_state,  # Continue SOC across episodes
         "seed": args.seed + 1000,
     }
     
@@ -187,22 +201,33 @@ def main():
     # The higher entropy means the policy will be more stochastic during training,
     # allowing it to try different action magnitudes (not just 0.1-0.2 kW)
     if args.algorithm == "PPO":
-        model = PPO(
-            "MlpPolicy",
-            env,
-            learning_rate=3e-4,
-            n_steps=2048,
-            batch_size=64,
-            n_epochs=10,
-            gamma=0.99,
-            gae_lambda=0.95,
-            clip_range=0.2,
-            ent_coef=0.05,  # CHANGED: Increased from 0.01 to 0.05 for more exploration
-            vf_coef=0.5,
-            verbose=1,
-            tensorboard_log=tensorboard_log,
-            seed=args.seed,
-        )
+            model = PPO(
+                "MlpPolicy",
+                env,
+                learning_rate=3e-4,
+                n_steps=2048,
+                batch_size=64,
+                n_epochs=10,
+                gamma=0.999,  # INCREASED from 0.99 to 0.999: Values future rewards more
+                # Higher gamma means the agent cares more about long-term consequences
+                # This helps with temporal credit assignment - charging now helps reduce grid usage later
+                gae_lambda=0.95,
+                clip_range=0.2,
+                ent_coef=0.3,  # HIGH: Maximum exploration to encourage larger actions
+                vf_coef=0.5,
+                verbose=1,
+                tensorboard_log=tensorboard_log,
+                seed=args.seed,
+                policy_kwargs=dict(
+                    # Initialize policy with VERY large standard deviation
+                    # Default log_std_init is usually -0.5 to -1.0 (std ≈ 0.6-0.37)
+                    # Using 1.5 means std=exp(1.5)≈4.48, encouraging very large initial actions
+                    # This forces the policy to explore the full action space from the start
+                    log_std_init=1.5,
+                    # Larger network for better capacity
+                    net_arch=dict(pi=[256, 256], vf=[256, 256])
+                ),
+            )
     else:  # SAC
         model = SAC(
             "MlpPolicy",
@@ -241,6 +266,7 @@ def main():
     print(f"Training data: {'SYNTHETIC' if args.use_synthetic else 'REAL'}")
     print(f"Testing data: REAL (unseen during training)")
     print(f"Training for {args.total_timesteps} timesteps")
+    print(f"Battery state: {'CONTINUOUS across episodes' if args.continue_battery_state else 'RESETS each episode'}")
     print(f"Models will be saved to: {args.output_dir}")
     if not args.use_synthetic:
         print(f"Train/test split: {args.train_split:.0%} train, {1-args.train_split:.0%} test")

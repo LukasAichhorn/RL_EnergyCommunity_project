@@ -208,7 +208,8 @@ class BatteryControlEnv(gym.Env):
     ) -> Tuple[float, float]:
         """
         Update battery state based on action.
-        Only allows charging from excess production (no grid charging).
+        If action is impossible, SOC does not update (returns 0 energy).
+        Agent learns from reward penalties.
         
         Args:
             action: Charge/discharge rate in kW (positive=charge, negative=discharge)
@@ -218,37 +219,35 @@ class BatteryControlEnv(gym.Env):
         Returns:
             Tuple of (actual_charge_kwh, actual_discharge_kwh)
         """
-        # Calculate available production for charging (excess after covering consumption)
+        # Calculate excess production (surplus available for charging)
         excess_production_kwh = max(0, total_production - total_consumption)
-        max_charge_from_production_kw = excess_production_kwh / self.timestep_duration_hours
+        # Check actual difference with small epsilon for floating point precision
+        surplus_exists = (total_production - total_consumption) > 1e-6
+
+        # Check for invalid actions - if invalid, don't update SOC
+        # Invalid action 1: Trying to charge when no surplus (no grid charging)
+        if action > 0 and not surplus_exists:
+            # Impossible action - return 0 energy, SOC doesn't change
+            return 0.0, 0.0
         
-        # Clip action to available capacity AND available production
-        max_charge = min(
-            self.max_charge_rate_kw,
-            (1.0 - self.battery_soc) * self.battery_capacity_kwh / self.timestep_duration_hours,
-            max_charge_from_production_kw  # Can't charge more than excess production
-        )
+        # Invalid action 2: Trying to discharge when battery is empty
+        if action < 0 and self.battery_soc <= 0.0:
+            # Impossible action - return 0 energy, SOC doesn't change
+            return 0.0, 0.0
         
-        max_discharge = min(
-            self.max_discharge_rate_kw,
-            self.battery_soc * self.battery_capacity_kwh / self.timestep_duration_hours
-        )
         
-        # Clip action - if trying to charge but no excess production, set to 0
-        if action > 0 and max_charge_from_production_kw <= 0:
-            action = 0.0  # No charging allowed if no excess production
-        else:
-            action = np.clip(action, -max_discharge, max_charge)
-        
-        # Calculate energy change
+        # Action is valid - calculate energy change and update SOC
         if action > 0:  # Charging
             energy_charged_kwh = action * self.timestep_duration_hours * self.efficiency
             energy_discharged_kwh = 0.0
-        else:  # Discharging
+        elif action < 0:  # Discharging
             energy_charged_kwh = 0.0
             energy_discharged_kwh = abs(action) * self.timestep_duration_hours / self.efficiency
+        else:  # No action
+            energy_charged_kwh = 0.0
+            energy_discharged_kwh = 0.0
         
-        # Update SOC
+        # Update SOC only if action was valid
         soc_change = (energy_charged_kwh - energy_discharged_kwh) / self.battery_capacity_kwh
         self.battery_soc = np.clip(self.battery_soc + soc_change, 0.0, 1.0)
         
@@ -259,52 +258,59 @@ class BatteryControlEnv(gym.Env):
         total_consumption: float,
         total_production: float,
         energy_charged_kwh: float,
-        energy_discharged_kwh: float
+        energy_discharged_kwh: float,
+        action_value_kw: float,  # Add this parameter
+        soc_before: float        # Add this parameter
     ) -> float:
         """
-        Calculate reward based on grid usage minimization.
+        Calculate reward based on grid usage and penalize invalid actions.
         
-        CHANGED: Now includes bonus for storing excess energy to encourage
-        more aggressive battery usage when excess production is available.
+        Reward formula:
+        reward = -grid_usage - invalid_action_penalty
         
-        Reward components:
-        1. Primary: -grid_usage (penalize grid dependency)
-        2. Bonus: +storage_bonus (reward storing excess energy)
-        3. Bonus: +soc_bonus (small reward for maintaining battery charge)
-        
-        Note: Charging only uses excess production (no grid charging allowed).
+        Where:
+        - grid_usage: Energy drawn from the grid
+        - invalid_action_penalty: Penalty for trying impossible actions
         """
-        # All production is available for consumption (charging only uses excess)
-        # Available energy = production + battery discharge
+        # Calculate available energy: production + battery discharge
         available_energy = total_production + energy_discharged_kwh
         
-        # Own coverage is how much consumption we can cover with our own resources
-        own_coverage = min(total_consumption, max(0, available_energy))
+        # Grid usage = consumption not covered by available energy
+        grid_usage = max(0, total_consumption - available_energy)
         
-        # Grid usage is only for consumption not covered
-        grid_usage = total_consumption - own_coverage
+        # Calculate excess production (surplus available for charging)
+        excess_production = max(0, total_production - total_consumption)
+        # Check actual difference with small epsilon for floating point precision
+        surplus_exists = (total_production - total_consumption) > 1e-6
         
-        # PRIMARY REWARD: Penalize grid usage (negative because we want to minimize)
-        # This is the main objective - minimize energy from grid
-        grid_penalty = -grid_usage
+        # Penalize invalid actions
+        invalid_action_penalty = 0.0
         
-        # BONUS 1: Reward storing excess energy (encourages aggressive charging)
-        # Calculate excess production that could be stored
-        excess_production_kwh = max(0, total_production - total_consumption)
+        # Penalty 1: Trying to charge when no surplus (grid charging not allowed)
+        if action_value_kw > 0 and not surplus_exists:
+            # Agent tried to charge but no surplus available
+            invalid_action_penalty = -10.0 * abs(action_value_kw) * self.timestep_duration_hours
         
-        # Storage bonus: reward proportional to how much excess we actually stored
-        # Scale by 0.1 to make it a bonus, not the primary reward
-        # This encourages the agent to charge more when excess is available
-        storage_bonus = 0.1 * energy_charged_kwh
+        # Penalty 2: Trying to discharge when battery is empty
+        elif action_value_kw < 0 and soc_before <= 0.001:
+            # Agent tried to discharge but battery was empty
+            invalid_action_penalty = -10.0 * abs(action_value_kw) * self.timestep_duration_hours
         
-        # BONUS 2: Small reward for maintaining battery charge (encourages keeping battery ready)
-        # This helps prevent the agent from keeping battery empty
-        # Scale by 0.05 to keep it small relative to grid penalty
-        soc_bonus = 0.05 * self.battery_soc
+        # Penalty 3: Trying to discharge when surplus exists (surplus must be used first)
+        elif action_value_kw < 0 and surplus_exists:
+            # Agent tried to discharge when surplus was available
+            invalid_action_penalty = -10.0 * abs(action_value_kw) * self.timestep_duration_hours
         
-        # Total reward: grid penalty (primary) + storage bonus + SOC bonus
-        reward = grid_penalty + storage_bonus + soc_bonus
-        
+        # In _calculate_reward(), after calculating grid_usage:
+        # Bonus for using stored energy to reduce grid usage
+        if energy_discharged_kwh > 0 and total_consumption > total_production:
+            # Agent discharged to reduce grid usage - give small bonus
+            discharge_bonus = 0.1 * energy_discharged_kwh
+        else:
+            discharge_bonus = 0.0
+
+        reward = -grid_usage + discharge_bonus + invalid_action_penalty
+                
         return reward
     
     def reset(
@@ -362,19 +368,25 @@ class BatteryControlEnv(gym.Env):
         total_consumption = row['total_consumption']
         total_production = row['total_production']
         
-        # Update battery (now with production/consumption constraints - no grid charging)
+        # Update battery (simple structure - just update SOC)
+        # Store SOC before battery update (needed for penalty calculations)
+        soc_before = self.battery_soc
+
+        # Update battery (simple structure - just update SOC)
         energy_charged_kwh, energy_discharged_kwh = self._update_battery(
             action_value, total_production, total_consumption
         )
-        
-        # Calculate reward
+
+        # Calculate reward (pass action and SOC before update for penalty calculation)
         reward = self._calculate_reward(
             total_consumption,
             total_production,
             energy_charged_kwh,
-            energy_discharged_kwh
+            energy_discharged_kwh,
+            action_value,  # Pass original action to detect invalid attempts
+            soc_before     # Pass SOC before update to check if battery was empty
         )
-        
+                
         # Update step counter
         self.current_step += 1
         self.current_data_idx += 1
