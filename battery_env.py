@@ -207,8 +207,12 @@ class BatteryControlEnv(gym.Env):
         total_consumption: float
     ) -> Tuple[float, float]:
         """
-        Update battery state based on action.
-        No constraints - agent learns from rewards only.
+        Update battery state based on action with physical constraints.
+        
+        Physical constraints enforced:
+        - Cannot discharge more than available energy in battery
+        - Cannot charge beyond battery capacity
+        - Cannot charge if no surplus available (no grid charging)
         
         Args:
             action: Charge/discharge rate in kW (positive=charge, negative=discharge)
@@ -218,13 +222,40 @@ class BatteryControlEnv(gym.Env):
         Returns:
             Tuple of (actual_charge_kwh, actual_discharge_kwh)
         """
-        # Calculate energy change based on action
+        surplus = total_production - total_consumption
+        
+        # Calculate desired energy change based on action
         if action > 0:  # Charging
+            # Physical constraint: Cannot charge without surplus
+            if surplus <= 0.1:
+                return 0.0, 0.0
+            
+            # Calculate energy to charge (with efficiency)
             energy_charged_kwh = action * self.timestep_duration_hours * self.efficiency
+            
+            # Physical constraint: Cannot charge beyond battery capacity
+            max_chargeable = (1.0 - self.battery_soc) * self.battery_capacity_kwh
+            energy_charged_kwh = min(energy_charged_kwh, max_chargeable)
+            
+            # Physical constraint: Cannot charge more than available surplus
+            energy_charged_kwh = min(energy_charged_kwh, surplus * self.efficiency)
+            
             energy_discharged_kwh = 0.0
+            
         elif action < 0:  # Discharging
-            energy_charged_kwh = 0.0
+            # Physical constraint: Cannot discharge if battery is empty
+            if self.battery_soc <= 0.01:
+                return 0.0, 0.0
+            
+            # Calculate energy to discharge (with efficiency loss)
             energy_discharged_kwh = abs(action) * self.timestep_duration_hours / self.efficiency
+            
+            # Physical constraint: Cannot discharge more than what's in battery
+            max_dischargeable = self.battery_soc * self.battery_capacity_kwh
+            energy_discharged_kwh = min(energy_discharged_kwh, max_dischargeable)
+            
+            energy_charged_kwh = 0.0
+            
         else:  # No action
             energy_charged_kwh = 0.0
             energy_discharged_kwh = 0.0
@@ -248,6 +279,7 @@ class BatteryControlEnv(gym.Env):
         Reward function with NO double-counting:
         1. Charge when surplus exists
         2. Discharge when deficit exists to minimize grid usage
+        3. Penalize impossible actions (even though they won't execute)
         """
         # Calculate surplus (excess production)
         surplus = total_production - total_consumption
@@ -260,15 +292,21 @@ class BatteryControlEnv(gym.Env):
         # Primary objective: minimize grid usage
         reward = -grid_usage
         
-        if surplus_exists:
+        # Penalty for impossible actions (agent attempted but physical constraints prevented)
+        # These help the agent learn to avoid impossible actions faster
+        if action_value_kw < 0 and soc_before <= 0.01:  # Tried to discharge from empty battery
+            reward -= 20.0 * abs(action_value_kw) * self.timestep_duration_hours
+        elif action_value_kw > 0 and not surplus_exists:  # Tried to charge without surplus
+            reward -= 20.0 * abs(action_value_kw) * self.timestep_duration_hours
+        elif action_value_kw < 0 and surplus_exists:  # Tried to discharge when surplus exists
+            reward -= 20.0 * abs(action_value_kw) * self.timestep_duration_hours
+        
+        # Reward/penalty for valid actions based on scenario
+        elif surplus_exists:
             # Scenario 1: We have surplus - should charge
             if action_value_kw > 0:  # Charging (correct action)
                 # Reward for storing surplus (future benefit)
-                # Make this strong enough to compete with immediate discharge rewards
                 reward += 1.5 * energy_charged_kwh
-            elif action_value_kw < 0:  # Discharging (WRONG - surplus should be used first)
-                # Strong penalty for discharging when surplus exists
-                reward -= 10.0 * abs(action_value_kw) * self.timestep_duration_hours
             else:  # Doing nothing (wasting surplus)
                 # Penalty for not storing available surplus
                 reward -= 0.5 * surplus
@@ -279,9 +317,7 @@ class BatteryControlEnv(gym.Env):
                 # NO EXTRA BONUS - grid usage reduction is already in the base reward
                 # The agent already benefits from reduced grid_usage penalty
                 pass  # Benefit is implicit in -grid_usage
-            elif action_value_kw > 0:  # Charging (WRONG - no surplus to charge from)
-                # Strong penalty for charging without surplus (would increase grid usage)
-                reward -= 10.0 * abs(action_value_kw) * self.timestep_duration_hours
+            # If doing nothing, no additional penalty (grid usage penalty is enough)
         
         return reward
     
