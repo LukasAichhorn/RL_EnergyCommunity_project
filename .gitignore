@@ -1,0 +1,50 @@
+# Metering data (sensitive/private data)
+metering_data_last_year.csv
+*.csv
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+.venv
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# IDE
+.vscode/
+.idea/
+.cursor/
+
+# Model files (can be large)
+*.zip
+models/
+models_*/
+*.pt
+*.pth
+*.ckpt
+
+# Evaluation results (can be large)
+evaluation_results/
+evaluation_results_*/
+
+# TensorBoard logs
+tensorboard/
+*.tfevents.*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.log
+*.swp
+*~
+
