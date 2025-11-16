@@ -57,14 +57,14 @@ class BatteryControlEnv(gym.Env):
         is_synthetic = "synthetic" in data_path.lower()
         
         if mode == "train" and is_synthetic:
-            # Load synthetic training data
-            all_data = load_and_preprocess_data(data_path)
+            # Load synthetic training data (always normalized by participants)
+            all_data = load_and_preprocess_data(data_path, normalize_by_participants=True)
             self.raw_data = all_data.copy()
             self.stats = get_data_statistics(self.raw_data)
             print(f"Using SYNTHETIC TRAIN data: {len(self.raw_data)} timesteps ({len(self.raw_data)/96:.1f} days)")
         else:
-            # Load real data
-            all_data = load_and_preprocess_data(data_path)
+            # Load real data (always normalized by participants)
+            all_data = load_and_preprocess_data(data_path, normalize_by_participants=True)
             
             # Handle 100% data case (train_split = 1.0)
             if train_split >= 1.0:

@@ -32,9 +32,9 @@ def generate_synthetic_data(
     if seed is not None:
         np.random.seed(seed)
     
-    # Load real data statistics if available
+    # Load real data statistics if available (always normalized by participants)
     if data_path:
-        real_data = load_and_preprocess_data(data_path)
+        real_data = load_and_preprocess_data(data_path, normalize_by_participants=True)
         stats = get_data_statistics(real_data)
         
         # Use real data statistics

@@ -1,1 +1,0 @@
-add penalty for batterie degredation.

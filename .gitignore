@@ -24,15 +24,17 @@ ENV/
 
 # Model files (can be large)
 *.zip
-models/
-models_*/
+models/checkpoints/
+models/logs/
+models/tensorboard/
 *.pt
 *.pth
 *.ckpt
 
-# Evaluation results (can be large)
-evaluation_results/
-evaluation_results_*/
+# Evaluation results (can be large - keep plots, exclude large data)
+evaluation_results/*.png
+evaluation_results/*.jpg
+evaluation_results/*.pdf
 
 # TensorBoard logs
 tensorboard/
