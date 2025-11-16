@@ -245,48 +245,43 @@ class BatteryControlEnv(gym.Env):
         soc_before: float
     ) -> float:
         """
-        Calculate reward to encourage:
-        1. Charging when surplus exists (store surplus for later)
-        2. Discharging when no surplus (use battery to reduce grid usage)
+        Reward function with NO double-counting:
+        1. Charge when surplus exists
+        2. Discharge when deficit exists to minimize grid usage
         """
-        # Calculate available energy: production + battery discharge
-        available_energy = total_production + energy_discharged_kwh
-        
-        # Grid usage = consumption not covered by available energy
-        grid_usage = max(0, total_consumption - available_energy)
-        
         # Calculate surplus (excess production)
         surplus = total_production - total_consumption
         surplus_exists = surplus > 0.1  # Meaningful threshold
         
-        # Base reward: penalize grid usage
+        # Calculate grid usage (what we actually draw from grid)
+        available_energy = total_production + energy_discharged_kwh
+        grid_usage = max(0, total_consumption - available_energy)
+        
+        # Primary objective: minimize grid usage
         reward = -grid_usage
         
         if surplus_exists:
-            # Case 1: We have surplus - reward charging (storing surplus)
-            charging_reward = 1.0 * energy_charged_kwh
-            reward += charging_reward
-            
-            # Penalty for not using available surplus
-            unused_surplus = max(0, surplus - energy_charged_kwh)
-            if unused_surplus > 0.1:
-                reward -= 0.3 * unused_surplus
-            
-            # IMPORTANT: Strong penalty for discharging when surplus exists
-            if action_value_kw < 0:  # Discharging when surplus exists
-                reward -= 5.0 * abs(action_value_kw) * self.timestep_duration_hours
+            # Scenario 1: We have surplus - should charge
+            if action_value_kw > 0:  # Charging (correct action)
+                # Reward for storing surplus (future benefit)
+                # Make this strong enough to compete with immediate discharge rewards
+                reward += 1.5 * energy_charged_kwh
+            elif action_value_kw < 0:  # Discharging (WRONG - surplus should be used first)
+                # Strong penalty for discharging when surplus exists
+                reward -= 10.0 * abs(action_value_kw) * self.timestep_duration_hours
+            else:  # Doing nothing (wasting surplus)
+                # Penalty for not storing available surplus
+                reward -= 0.5 * surplus
         
         else:
-            # Case 2: No surplus (deficit) - reward discharging (reducing grid usage)
-            if energy_discharged_kwh > 0:
-                grid_usage_without_discharge = max(0, total_consumption - total_production)
-                grid_usage_reduction = grid_usage_without_discharge - grid_usage
-                discharge_reward = 1.0 * grid_usage_reduction
-                reward += discharge_reward
-            
-            # IMPORTANT: Penalty for charging when there's no surplus
-            if action_value_kw > 0:  # Charging when no surplus (wasteful)
-                reward -= 5.0 * abs(action_value_kw) * self.timestep_duration_hours
+            # Scenario 2: Deficit (no surplus) - should discharge to reduce grid usage
+            if action_value_kw < 0 and energy_discharged_kwh > 0:  # Discharging (correct action)
+                # NO EXTRA BONUS - grid usage reduction is already in the base reward
+                # The agent already benefits from reduced grid_usage penalty
+                pass  # Benefit is implicit in -grid_usage
+            elif action_value_kw > 0:  # Charging (WRONG - no surplus to charge from)
+                # Strong penalty for charging without surplus (would increase grid usage)
+                reward -= 10.0 * abs(action_value_kw) * self.timestep_duration_hours
         
         return reward
     
