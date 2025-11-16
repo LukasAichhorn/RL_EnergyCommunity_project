@@ -8,10 +8,39 @@ from stable_baselines3 import PPO, SAC
 from stable_baselines3.common.callbacks import EvalCallback, CheckpointCallback
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import DummyVecEnv
+from stable_baselines3.common.callbacks import CallbackList, BaseCallback
 import numpy as np
 
 from battery_env import BatteryControlEnv
 from data_simulator import generate_synthetic_data, save_synthetic_data
+
+
+class LearningRateDecayCallback(BaseCallback):
+    """Callback to decay learning rate and entropy coefficient over time."""
+    def __init__(self, initial_lr, final_lr, initial_ent_coef, final_ent_coef, total_timesteps, verbose=0):
+        super().__init__(verbose)
+        self.initial_lr = initial_lr
+        self.final_lr = final_lr
+        self.initial_ent_coef = initial_ent_coef
+        self.final_ent_coef = final_ent_coef
+        self.total_timesteps = total_timesteps
+    
+    def _on_step(self) -> bool:
+        # Linear decay
+        progress = min(1.0, self.num_timesteps / self.total_timesteps)
+        
+        # Decay learning rate (update optimizer)
+        current_lr = self.initial_lr * (1 - progress) + self.final_lr * progress
+        if hasattr(self.model, 'policy') and hasattr(self.model.policy, 'optimizer'):
+            for param_group in self.model.policy.optimizer.param_groups:
+                param_group['lr'] = current_lr
+        
+        # Decay entropy coefficient (only for PPO)
+        if hasattr(self.model, 'ent_coef'):
+            current_ent_coef = self.initial_ent_coef * (1 - progress) + self.final_ent_coef * progress
+            self.model.ent_coef = current_ent_coef
+        
+        return True
 
 
 def make_env(env_config, rank=0, seed=0):
@@ -129,6 +158,12 @@ def main():
         help="Reset battery SOC each episode (disable continuous battery state)"
     )
     parser.set_defaults(continue_battery_state=True)
+    parser.add_argument(
+        "--load-model",
+        type=str,
+        default=None,
+        help="Path to existing model to continue training from (optional)"
+    )
     
     args = parser.parse_args()
     
@@ -195,55 +230,58 @@ def main():
         print("TensorBoard not installed. Training will continue without TensorBoard logging.")
         print("Install with: pip install tensorboard")
     
-    # Algorithm configuration
-    # CHANGED: Increased entropy coefficient from 0.01 to 0.05 to encourage more exploration
-    # This helps the agent explore larger actions and find better policies
-    # The higher entropy means the policy will be more stochastic during training,
-    # allowing it to try different action magnitudes (not just 0.1-0.2 kW)
-    if args.algorithm == "PPO":
+    # Load existing model or create new one
+    if args.load_model and os.path.exists(args.load_model):
+        print(f"Loading existing model from: {args.load_model}")
+        if args.algorithm == "PPO":
+            model = PPO.load(args.load_model, env=env, tensorboard_log=tensorboard_log)
+        else:
+            model = SAC.load(args.load_model, env=env, tensorboard_log=tensorboard_log)
+        print("Model loaded successfully. Continuing training...")
+    else:
+        if args.load_model:
+            print(f"Warning: Model path '{args.load_model}' not found. Creating new model.")
+        
+        # Algorithm configuration
+        # Initial high entropy for exploration, will decay over time
+        # Learning rate will also decay to prevent instability
+        if args.algorithm == "PPO":
             model = PPO(
                 "MlpPolicy",
                 env,
-                learning_rate=3e-4,
+                learning_rate=3e-4,  # Will decay to 1e-5
                 n_steps=2048,
                 batch_size=64,
                 n_epochs=10,
-                gamma=0.999,  # INCREASED from 0.99 to 0.999: Values future rewards more
-                # Higher gamma means the agent cares more about long-term consequences
-                # This helps with temporal credit assignment - charging now helps reduce grid usage later
+                gamma=0.999,  # High gamma: values future rewards
                 gae_lambda=0.95,
                 clip_range=0.2,
-                ent_coef=0.3,  # HIGH: Maximum exploration to encourage larger actions
+                ent_coef=0.1,  # Start with moderate exploration, will decay to 0.01
                 vf_coef=0.5,
                 verbose=1,
                 tensorboard_log=tensorboard_log,
                 seed=args.seed,
                 policy_kwargs=dict(
-                    # Initialize policy with VERY large standard deviation
-                    # Default log_std_init is usually -0.5 to -1.0 (std ≈ 0.6-0.37)
-                    # Using 1.5 means std=exp(1.5)≈4.48, encouraging very large initial actions
-                    # This forces the policy to explore the full action space from the start
-                    log_std_init=1.5,
-                    # Larger network for better capacity
+                    log_std_init=1.0,  # Moderate initial exploration
                     net_arch=dict(pi=[256, 256], vf=[256, 256])
                 ),
             )
-    else:  # SAC
-        model = SAC(
-            "MlpPolicy",
-            env,
-            learning_rate=3e-4,
-            buffer_size=100000,
-            learning_starts=1000,
-            batch_size=256,
-            tau=0.005,
-            gamma=0.99,
-            train_freq=(1, "step"),
-            gradient_steps=1,
-            verbose=1,
-            tensorboard_log=tensorboard_log,
-            seed=args.seed,
-        )
+        else:  # SAC
+            model = SAC(
+                "MlpPolicy",
+                env,
+                learning_rate=3e-4,  # Will decay to 1e-5
+                buffer_size=100000,
+                learning_starts=1000,
+                batch_size=256,
+                tau=0.005,
+                gamma=0.99,
+                train_freq=(1, "step"),
+                gradient_steps=1,
+                verbose=1,
+                tensorboard_log=tensorboard_log,
+                seed=args.seed,
+            )
     
     # Callbacks
     checkpoint_callback = CheckpointCallback(
@@ -261,6 +299,15 @@ def main():
         render=False,
     )
     
+    # Learning rate and entropy decay callback (prevents instability from over-training)
+    lr_decay_callback = LearningRateDecayCallback(
+        initial_lr=3e-4,
+        final_lr=1e-5,
+        initial_ent_coef=0.1 if args.algorithm == "PPO" else 0.0,
+        final_ent_coef=0.01 if args.algorithm == "PPO" else 0.0,
+        total_timesteps=args.total_timesteps
+    )
+    
     # Training
     print(f"Starting training with {args.algorithm}...")
     print(f"Training data: {'SYNTHETIC' if args.use_synthetic else 'REAL'}")
@@ -268,13 +315,18 @@ def main():
     print(f"Training for {args.total_timesteps} timesteps")
     print(f"Battery state: {'CONTINUOUS across episodes' if args.continue_battery_state else 'RESETS each episode'}")
     print(f"Models will be saved to: {args.output_dir}")
+    if args.load_model:
+        print(f"Continuing training from: {args.load_model}")
+    print(f"Learning rate: 3e-4 → 1e-5 (decay over training)")
+    if args.algorithm == "PPO":
+        print(f"Entropy coefficient: 0.1 → 0.01 (decay over training)")
     if not args.use_synthetic:
         print(f"Train/test split: {args.train_split:.0%} train, {1-args.train_split:.0%} test")
     
     try:
         model.learn(
             total_timesteps=args.total_timesteps,
-            callback=[checkpoint_callback, eval_callback],
+            callback=[checkpoint_callback, eval_callback, lr_decay_callback],
             progress_bar=True,
         )
     except KeyboardInterrupt:
