@@ -313,11 +313,37 @@ class BatteryControlEnv(gym.Env):
         
         else:
             # Scenario 2: Deficit (no surplus) - should discharge to reduce grid usage
+            deficit = total_consumption - total_production  # How much we need from battery/grid
+            
             if action_value_kw < 0 and energy_discharged_kwh > 0:  # Discharging (correct action)
-                # NO EXTRA BONUS - grid usage reduction is already in the base reward
-                # The agent already benefits from reduced grid_usage penalty
-                pass  # Benefit is implicit in -grid_usage
-            # If doing nothing, no additional penalty (grid usage penalty is enough)
+                # EXPLICIT BONUS for discharging to help reduce grid usage
+                grid_without_discharge = max(0, total_consumption - total_production)
+                grid_reduction = grid_without_discharge - grid_usage
+                # Give positive reward for the reduction
+                reward += 2.0 * grid_reduction  # Increased from 1.0 to 2.0
+                
+                # BONUS: Encourage stronger discharge when battery has more energy
+                battery_availability_bonus = 1.0 * soc_before * energy_discharged_kwh  # Increased from 0.5 to 1.0
+                reward += battery_availability_bonus
+                
+                # NEW: Penalty for INSUFFICIENT discharge when deficit is large
+                # If we could discharge more (battery has energy) but didn't discharge enough
+                max_possible_discharge_kwh = min(
+                    soc_before * self.battery_capacity_kwh,  # What's available in battery
+                    deficit  # What's actually needed
+                )
+                
+                if max_possible_discharge_kwh > energy_discharged_kwh * 1.5:
+                    # Agent is discharging less than 67% of what it could/should
+                    discharge_shortfall = max_possible_discharge_kwh - energy_discharged_kwh
+                    weak_discharge_penalty = 3.0 * discharge_shortfall * soc_before
+                    reward -= weak_discharge_penalty
+                
+            # If doing nothing when deficit exists AND battery has energy, penalize HEAVILY
+            elif soc_before > 0.1 and grid_usage > 0.1:
+                # Battery has energy but not using it when grid usage exists
+                unused_battery_penalty = 1.0 * soc_before * grid_usage  # Increased from 0.3 to 1.0
+                reward -= unused_battery_penalty
         
         return reward
     
